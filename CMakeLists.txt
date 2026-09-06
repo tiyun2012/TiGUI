@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 
 project(MyUI_Milestone1 LANGUAGES CXX)
 
+# Native Windows executable using a C++20 baseline for the future framework.
 add_executable(MyUI_Milestone1 WIN32
     src/main.cpp
     src/Win32Window.cpp

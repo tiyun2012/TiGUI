@@ -5,6 +5,8 @@ namespace
     constexpr wchar_t kWindowClassName[] = L"MyUI_Milestone1_Window";
     constexpr wchar_t kWindowTitle[] = L"MyUI - Milestone 1";
 
+    // Register a native Win32 window class. The class tells Windows which
+    // callback should receive messages for windows created from it.
     bool RegisterWindowClass(HINSTANCE hInstance)
     {
         WNDCLASSEXW wc{};
@@ -25,9 +27,19 @@ bool Win32Window::Create(HINSTANCE hInstance, int nCmdShow)
     if (!RegisterWindowClass(hInstance))
         return false;
 
-    RECT rect{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    // AdjustWindowRect converts the desired client area into the total HWND
+    // size including the title bar and borders.
+    RECT rect{
+        0,
+        0,
+        static_cast<LONG>(width_),
+        static_cast<LONG>(height_)
+    };
+
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
+    // Passing "this" as lpParam lets WM_NCCREATE give the WindowProc a pointer
+    // to this C++ object. We store it in GWLP_USERDATA below.
     hwnd_ = CreateWindowExW(
         0,
         kWindowClassName,
@@ -56,13 +68,13 @@ LRESULT CALLBACK Win32Window::WindowProc(
     WPARAM wParam,
     LPARAM lParam)
 {
-    Win32Window* self =
-        reinterpret_cast<Win32Window*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    // Retrieve the C++ object pointer after WM_NCCREATE has stored it.
+    Win32Window* self = reinterpret_cast<Win32Window*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 
     if (msg == WM_NCCREATE)
     {
-        auto* createStruct =
-            reinterpret_cast<CREATESTRUCTW*>(lParam);
+        auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
 
         self = static_cast<Win32Window*>(createStruct->lpCreateParams);
 
@@ -76,6 +88,7 @@ LRESULT CALLBACK Win32Window::WindowProc(
 
     if (msg == WM_DESTROY)
     {
+        // This causes the main application loop to terminate.
         PostQuitMessage(0);
         return 0;
     }

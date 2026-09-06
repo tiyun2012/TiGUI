@@ -1,6 +1,5 @@
 #include "DX12Renderer.h"
 
-#include <array>
 #include <cassert>
 #include <stdexcept>
 
@@ -8,6 +7,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
+    // Turn a failed HRESULT into an exception so the initialization sequence
+    // remains easy to read. The top-level Initialize() catches the failure.
     void CheckHR(HRESULT hr)
     {
         if (FAILED(hr))
@@ -23,14 +24,21 @@ bool DX12Renderer::Initialize(HWND hwnd, UINT width, UINT height)
         width_ = width;
         height_ = height;
 
-        #if defined(_DEBUG)
+        // Enable D3D12 validation in Debug builds. This should be enabled
+        // before creating the device so validation covers device creation.
+#if defined(_DEBUG)
         {
             ComPtr<ID3D12Debug> debugController;
-            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController))))
-                debugController->EnableDebugLayer();
-        }
-        #endif
 
+            if (SUCCEEDED(D3D12GetDebugInterface(
+                    IID_PPV_ARGS(&debugController))))
+            {
+                debugController->EnableDebugLayer();
+            }
+        }
+#endif
+
+        // DXGI owns graphics infrastructure such as adapters and swap chains.
         CheckHR(CreateDXGIFactory2(
             0,
             IID_PPV_ARGS(&factory_)));
@@ -57,6 +65,7 @@ bool DX12Renderer::Initialize(HWND hwnd, UINT width, UINT height)
     }
     catch (...)
     {
+        // Release anything already created before reporting failure.
         Shutdown();
         return false;
     }
@@ -64,6 +73,8 @@ bool DX12Renderer::Initialize(HWND hwnd, UINT width, UINT height)
 
 bool DX12Renderer::CreateDevice()
 {
+    // nullptr selects the default hardware adapter. Feature level 11_0 is
+    // enough for this first clear/present renderer.
     HRESULT hr = D3D12CreateDevice(
         nullptr,
         D3D_FEATURE_LEVEL_11_0,
@@ -74,6 +85,7 @@ bool DX12Renderer::CreateDevice()
 
 bool DX12Renderer::CreateCommandObjects()
 {
+    // A DIRECT queue can execute the normal graphics command types.
     D3D12_COMMAND_QUEUE_DESC queueDesc{};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 
@@ -81,10 +93,12 @@ bool DX12Renderer::CreateCommandObjects()
         &queueDesc,
         IID_PPV_ARGS(&commandQueue_)));
 
+    // The allocator supplies memory used while recording a command list.
     CheckHR(device_->CreateCommandAllocator(
         D3D12_COMMAND_LIST_TYPE_DIRECT,
         IID_PPV_ARGS(&commandAllocator_)));
 
+    // Create the graphics command list associated with that allocator.
     CheckHR(device_->CreateCommandList(
         0,
         D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -92,7 +106,8 @@ bool DX12Renderer::CreateCommandObjects()
         nullptr,
         IID_PPV_ARGS(&commandList_)));
 
-    // A newly created command list starts in the recording state.
+    // Newly-created command lists are already open. Close here so every frame
+    // follows the same Reset -> record -> Close pattern.
     CheckHR(commandList_->Close());
 
     return true;
@@ -100,7 +115,9 @@ bool DX12Renderer::CreateCommandObjects()
 
 bool DX12Renderer::CreateSwapChain(HWND hwnd, UINT width, UINT height)
 {
+    // Describe the two images that will alternate as the displayed back buffer.
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc{};
+
     swapChainDesc.BufferCount = FrameCount;
     swapChainDesc.Width = width;
     swapChainDesc.Height = height;
@@ -119,6 +136,7 @@ bool DX12Renderer::CreateSwapChain(HWND hwnd, UINT width, UINT height)
         nullptr,
         &swapChain1));
 
+    // We will manage fullscreen explicitly in a later window layer.
     CheckHR(factory_->MakeWindowAssociation(
         hwnd,
         DXGI_MWA_NO_ALT_ENTER));
@@ -140,6 +158,7 @@ bool DX12Renderer::CreateRTVHeap()
         &heapDesc,
         IID_PPV_ARGS(&rtvHeap_)));
 
+    // Descriptor size is implementation-dependent and must be queried.
     rtvDescriptorSize_ =
         device_->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -154,15 +173,18 @@ bool DX12Renderer::CreateRenderTargets()
 
     for (UINT i = 0; i < FrameCount; ++i)
     {
+        // Get the actual swap-chain resource for this buffer.
         CheckHR(swapChain_->GetBuffer(
             i,
             IID_PPV_ARGS(&renderTargets_[i])));
 
+        // Create an RTV descriptor that points to that resource.
         device_->CreateRenderTargetView(
             renderTargets_[i].Get(),
             nullptr,
             handle);
 
+        // Move to the next descriptor slot.
         handle.ptr += rtvDescriptorSize_;
     }
 
@@ -178,6 +200,8 @@ bool DX12Renderer::CreateSyncObjects()
 
     fenceValue_ = 0;
 
+    // Windows event used to put the CPU thread to sleep until the GPU reaches
+    // a requested fence value.
     fenceEvent_ = CreateEventW(
         nullptr,
         FALSE,
@@ -194,24 +218,27 @@ bool DX12Renderer::BeginFrame()
 
     try
     {
+        // Milestone 1 waits for the GPU at the end of every frame. Therefore it
+        // is safe to reuse this single allocator and command list.
         CheckHR(commandAllocator_->Reset());
         CheckHR(commandList_->Reset(
             commandAllocator_.Get(),
             nullptr));
 
+        // Transition the current back buffer so it can be rendered into.
+        //
+        //     PRESENT -> RENDER_TARGET
+        //
+        // D3D12 requires this state change to be explicit.
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource =
-            renderTargets_[frameIndex_].Get();
-        barrier.Transition.StateBefore =
-            D3D12_RESOURCE_STATE_PRESENT;
-        barrier.Transition.StateAfter =
-            D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.pResource = renderTargets_[frameIndex_].Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
-        commandList_->ResourceBarrier(
-            1,
-            &barrier);
+        commandList_->ResourceBarrier(1, &barrier);
 
+        // Locate the RTV belonging to the current frame.
         D3D12_CPU_DESCRIPTOR_HANDLE rtv =
             rtvHeap_->GetCPUDescriptorHandleForHeapStart();
 
@@ -219,6 +246,7 @@ bool DX12Renderer::BeginFrame()
             static_cast<SIZE_T>(frameIndex_) *
             rtvDescriptorSize_;
 
+        // Tell the output-merger stage which render target receives writes.
         commandList_->OMSetRenderTargets(
             1,
             &rtv,
@@ -245,55 +273,53 @@ void DX12Renderer::Clear(const std::array<float, 4>& color)
         static_cast<SIZE_T>(frameIndex_) *
         rtvDescriptorSize_;
 
+    // std::array is contiguous, so data() provides the float[4] expected by
+    // the D3D12 API.
     commandList_->ClearRenderTargetView(
         rtv,
         color.data(),
         0,
         nullptr);
 }
+
 void DX12Renderer::EndFrame()
 {
     assert(frameBegun_);
 
+    // The back buffer must be returned to PRESENT before Present() is called.
+    //
+    //     RENDER_TARGET -> PRESENT
+    //
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource =
-        renderTargets_[frameIndex_].Get();
-    barrier.Transition.StateBefore =
-        D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter =
-        D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.pResource = renderTargets_[frameIndex_].Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 
-    commandList_->ResourceBarrier(
-        1,
-        &barrier);
+    commandList_->ResourceBarrier(1, &barrier);
 
+    // Stop recording and submit the command list to the GPU.
     CheckHR(commandList_->Close());
 
-    ID3D12CommandList* lists[] = {
-        commandList_.Get()
-    };
+    ID3D12CommandList* lists[] = { commandList_.Get() };
+    commandQueue_->ExecuteCommandLists(1, lists);
 
-    commandQueue_->ExecuteCommandLists(
-        1,
-        lists);
+    // Ask the swap chain to display the completed back buffer.
+    CheckHR(swapChain_->Present(1, 0));
 
-    CheckHR(swapChain_->Present(
-        1,
-        0));
-
+    // Simple Milestone 1 synchronization. This is intentionally conservative.
     WaitForGpu();
 
-    frameIndex_ =
-        swapChain_->GetCurrentBackBufferIndex();
-
+    frameIndex_ = swapChain_->GetCurrentBackBufferIndex();
     frameBegun_ = false;
 }
 
 void DX12Renderer::WaitForGpu()
 {
+    // Give this submission a new fence value.
     ++fenceValue_;
 
+    // The GPU will signal the fence when it reaches this point in the queue.
     CheckHR(commandQueue_->Signal(
         fence_.Get(),
         fenceValue_));
@@ -304,9 +330,8 @@ void DX12Renderer::WaitForGpu()
             fenceValue_,
             fenceEvent_));
 
-        WaitForSingleObject(
-            fenceEvent_,
-            INFINITE);
+        // Block the CPU until the GPU has completed the submitted work.
+        WaitForSingleObject(fenceEvent_, INFINITE);
     }
 }
 
@@ -320,6 +345,7 @@ void DX12Renderer::Shutdown()
         }
         catch (...)
         {
+            // Ignore shutdown synchronization errors while leaving the app.
         }
     }
 
